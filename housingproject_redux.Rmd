@@ -1,0 +1,253 @@
+---
+title: "housingproject_redux"
+output: pdf_document
+date: "2024-05-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#housing project redux
+#set directory
+setwd("/Users/seanmilligan/Desktop/EC424/Homework/housingproject_redux")
+
+#loading packages
+pacman::p_load(tidyverse, tidymodels, skimr, caret, leaps, magrittr, janitor, glmnet, zoo)
+```
+
+```{r}
+#loading data
+training_df = read.csv('train.csv')
+test_df = read.csv('test.csv')
+
+#create age variable (year sold - year built)
+house_df = training_df %>% transmute(
+  id = Id,
+  sale_price = log(SalePrice),
+  age = YrSold - YearBuilt,
+  remod = YrSold - YearRemodAdd,
+  area = GrLivArea,
+  lot_area = LotArea,
+  cond = OverallCond,
+  veneer = MasVnrArea,
+  bsmt_sf = TotalBsmtSF,
+  bath = FullBath,
+  bed_abv = BedroomAbvGr,
+  kit_abv = KitchenAbvGr,
+  rms_abv = TotRmsAbvGrd,
+  fire = Fireplaces,
+  grg_age = YrSold - GarageYrBlt,
+  wd_dck = WoodDeckSF,
+  cl_prch = EnclosedPorch,
+  pool = PoolArea
+)
+```
+
+```{r}
+#5-fold cross validation
+#set seed
+set.seed(1234)
+#5-fold CV on training dataset
+house_cv = house_df %>% vfold_cv(v = 5)
+#view CV
+house_cv %>% tidy()
+
+#define a recipe_all is
+recipe_all = recipe(sale_price ~ ., data = house_df)
+
+#putting it together
+house_recipe = recipe_all %>%
+  #mean imputation for numeric predictors
+  step_impute_mean(all_predictors() & all_numeric()) %>%
+  #KNN imputation for categorical predictors
+  step_impute_knn(all_predictors() & all_nominal(), neighbors = 5 ) %>%
+  #create dummies for categorical variables
+  step_dummy(all_predictors() & all_nominal()) 
+
+#putting it together (again for Forward selection)
+house_clean = recipe_all %>%
+  #mean imputation for numeric predictors
+  step_impute_mean(all_predictors() & all_numeric()) %>%
+  #KNN imputation for categorical predictors
+  step_impute_knn(all_predictors() & all_nominal(), neighbors = 5 ) %>%
+  #create dummies for categorical variables
+  step_dummy(all_predictors() & all_nominal()) %>%
+  #prep and juicing!
+  prep() %>% juice()
+```
+
+```{r}
+#defining model (model type and desired engine)
+model_lm =
+  linear_reg() %>%
+  set_mode('regression') %>%
+  set_engine('lm')
+
+#estimating linear regression
+#fitting simple linear regression using tidymodels
+lm_workflow = 
+  workflow() %>% 
+  add_model(model_lm) %>%
+  add_recipe(house_recipe)
+
+#fit workflow to data
+lm_fit = 
+  lm_workflow %>%
+  fit(data = house_df)
+
+#view model summary
+lm_fit %>% extract_fit_parsnip() %>% tidy()
+
+#fitting linear regression w/ 5-fold CV 
+fit_lm_cv =
+  workflow() %>%
+  add_model(model_lm) %>%
+  add_recipe(house_recipe) %>%
+  fit_resamples(house_cv)
+#checking performance
+fit_lm_cv %>% collect_metrics()
+
+#checking performance within each fold 
+fit_lm_cv %>% collect_metrics(summarize = F)
+
+#forward selection for available variables
+train_forward1 = train(
+  y = house_clean[["sale_price"]],
+  x = house_clean %>% dplyr::select(-sale_price),
+  trControl = trainControl(method = "cv", number = 5),
+  method = "leapForward",
+  tuneGrid = expand.grid(nvmax = 1:18)
+)
+  
+train_forward1$results
+
+#model with all variables has lowest RMSE ^^^
+```
+
+Our model containing all variables possesses the lowest Residual Mean Squared Error.
+
+```{r}
+#using lasso regression w/tidy models with CV
+#standardizing data for use
+house_recipe_lasso = house_clean %>% recipe(sale_price ~ .) %>%
+  update_role(id, new_role = 'id_variable') %>%
+  step_normalize(all_predictors() & all_numeric()) %>%
+  step_dummy(all_predictors() & all_nominal()) %>%
+  step_rename_at(everything(), fn = str_to_lower)
+#time to juice it up
+house_recipe_lasso_clean = house_recipe %>% prep() %>% juice()
+
+```
+
+```{r}
+#using lasso and ridge w/5-fold cross validation for penalty on lasso and regression
+set.seed(12345)
+ctrl_cv = trainControl(method = "cv", number = 5)
+
+#define range of lambdas (glmnet wants decreasing range)
+lambdas = 10^seq(from = 5, to = -2, length = 100)
+
+#defining model 
+lasso_est = linear_reg(penalty = tune(), mixture = 1) %>% set_engine('glmnet')
+
+#defining lasso workflow
+workflow_lasso = workflow() %>%
+  add_model(lasso_est) %>% add_recipe(house_recipe_lasso)
+#CV w/range of lambdas
+cv_lasso =
+  workflow_lasso %>%
+  tune_grid(
+    resamples = vfold_cv(house_clean, v = 5),
+    grid = data.frame(penalty = lambdas),
+    metrics = metric_set(rmse)
+  )
+#show best models
+cv_lasso %>% show_best()
+
+#finding best lambda
+cv_lasso$.metrics
+
+#lowest RMSE ~0.182 @ lambda = 0.0118
+#fitting final model
+final_lasso = glmnet(
+  x = house_clean %>% dplyr::select(-sale_price, -id) %>% as.matrix(),
+  y = house_clean$sale_price,
+  standardize = T,
+  alpha = 1, 
+  lambda = 0.0118
+)
+
+```
+
+```{r}
+#cleaning test data set
+#create age variable (year sold - year built)
+pred_df = test_df %>% transmute(
+    id = Id,
+    age = YrSold - YearBuilt,
+    remod = YrSold - YearRemodAdd,
+    area = GrLivArea,
+    lot_area = LotArea,
+    cond = OverallCond,
+    veneer = MasVnrArea,
+    bsmt_sf = TotalBsmtSF,
+    bath = FullBath,
+    bed_abv = BedroomAbvGr,
+    kit_abv = KitchenAbvGr,
+    rms_abv = TotRmsAbvGrd,
+    fire = Fireplaces,
+    grg_age = YrSold - GarageYrBlt,
+    wd_dck = WoodDeckSF,
+    cl_prch = EnclosedPorch,
+    pool = PoolArea
+  )
+
+#create function to remove NA values from all columns
+rep_NA_func = function(data) {
+  for (col in names(data)) {
+    data[[col]] = na.aggregate(data[[col]])
+  }
+  return(data)  
+}
+
+#clean prediction dataframe w/rep_NA function
+pred_clean = rep_NA_func(pred_df)
+```
+
+```{r}
+#logarithmic prediction
+pred_log = predict(
+  final_lasso,
+  type = "response",
+  #our chosen lambda 
+  s = 0.0118,
+  #our data
+  newx = pred_clean %>% dplyr::select(-id) %>% as.matrix()
+)
+
+#final prediction w/o logarithms
+pred_final = exp(pred_log)
+
+#create submission datatset
+submit_df = data.frame(
+  Id = test_df$Id,
+  SalePrice = pred_final
+)
+
+#change name of s1 to SalePrice
+colnames(submit_df)[colnames(submit_df) == 's1'] = 'SalePrice'
+
+#view first few lines of dataset
+head(submit_df)
+
+#save dataset as CSV
+write_csv(x = submit_df, file = 'spm_submit_redux.csv')
+
+```
+
+
+
+
+
